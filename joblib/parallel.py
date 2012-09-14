@@ -524,6 +524,7 @@ Sub-process traceback:
 
         finally:
             if n_jobs > 1:
+                self._pool.terminate()
                 self._pool.close()
                 self._pool.terminate()  # terminate does a join()
             self._jobs = list()
