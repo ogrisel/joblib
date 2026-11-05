@@ -69,6 +69,12 @@ In Development
   splitting used by workers to limit OpenMP and BLAS libraries.
   https://github.com/joblib/joblib/pull/1871
 
+- Overlapping threading and sequential :class:`~joblib.Parallel` calls no
+  longer leak a lowered OpenBLAS thread count. Process-wide OpenBLAS pools are
+  limited by the first active call and restored only when the last call exits.
+  Worker threads set thread-local limits such as OpenMP, and do not take the
+  process-wide OpenBLAS claim.
+
 - Dropped support for Python 3.10, which is now end-of-life. NumPy and
   Distributed minimum supported versions were also increased to the oldest
   versions that support 3.11.

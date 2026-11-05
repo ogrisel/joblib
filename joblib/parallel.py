@@ -28,6 +28,7 @@ from ._multiprocessing_helpers import mp
 # Make sure that those two classes are part of the public joblib.parallel API
 # so that 3rd party backend implementers can import them from here.
 from ._parallel_backends import (
+    _SHARED_POOL_LIMIT,
     AutoBatchingMixin,  # noqa
     FallbackToBackend,
     LokyBackend,
@@ -36,6 +37,8 @@ from ._parallel_backends import (
     SequentialBackend,
     ThreadingBackend,
     _get_threadpool_controller,
+    _restore_thread_local_limits,
+    _set_thread_local_limits,
     cpu_count,  # noqa
     set_thread_local_cpu_limit,  # noqa
 )
@@ -1908,11 +1911,19 @@ class Parallel(Logger):
         This simplifies the traceback in case of errors and reduces the
         overhead of calling sequential tasks with `joblib`.
         """
-        limiter = None
+        thread_local_limits = []
+        shared_pool_limit_active = False
         try:
-            # This makes relevant libraries respect cgroups, for example:
-            limiter = _get_threadpool_controller().limit(
-                limits=self._backend._n_threads_for_worker_external_libs(n_jobs=1)
+            # Thread-local pools (OpenMP) are limited on this thread, which is
+            # the thread that runs the tasks. The process-wide OpenBLAS pool
+            # goes through the shared gate so overlapping calls do not restore
+            # each other's snapshot.
+            controller = _get_threadpool_controller()
+            num_threads = self._backend._n_threads_for_worker_external_libs(n_jobs=1)
+            _SHARED_POOL_LIMIT.enter(controller, num_threads)
+            shared_pool_limit_active = True
+            thread_local_limits = _set_thread_local_limits(
+                controller, num_threads, save=True
             )
             self._iterating = True
             self._original_iterator = iterable
@@ -1944,9 +1955,9 @@ class Parallel(Logger):
             self._aborted = True
             raise
         finally:
-            # limiter might be None if instantiating it failed.
-            if limiter is not None:
-                limiter.restore_original_limits()
+            _restore_thread_local_limits(thread_local_limits)
+            if shared_pool_limit_active:
+                _SHARED_POOL_LIMIT.exit()
             self._running = False
             self._iterating = False
             self._original_iterator = None

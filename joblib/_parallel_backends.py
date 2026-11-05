@@ -32,6 +32,13 @@ try:
 except ImportError:
     from threadpoolctl import ThreadpoolController as _get_threadpool_controller
 
+try:
+    from threadpoolctl import DID_NOT_SET as _DID_NOT_SET
+except ImportError:
+    # threadpoolctl < 3.8.1 does not tell the caller when set_num_threads()
+    # refused to run because another thread controls OpenBLAS.
+    _DID_NOT_SET = object()
+
 from ._multiprocessing_helpers import mp
 from ._utils import (
     _retrieve_traceback_capturing_wrapped_call,
@@ -118,6 +125,124 @@ def _split_up_cores(total_cores: int, n_jobs: int) -> int:
     heuristic might someday be used instead.
     """
     return max(total_cores // n_jobs, 1)
+
+
+def _is_process_wide_pool(lib) -> bool:
+    """Whether this library has one thread pool for the whole process.
+
+    OpenBLAS with the pthreads or Windows threading layer is shared by every
+    Python thread, and threadpoolctl allows only one of them to change it.
+    The OpenMP build of OpenBLAS is thread-local and is not included.
+    """
+    try:
+        from threadpoolctl import OpenBLASController
+    except ImportError:
+        return False
+    if not isinstance(lib, OpenBLASController):
+        return False
+    return getattr(lib, "threading_layer", None) != "openmp"
+
+
+def _set_thread_local_limits(controller, num_threads: int, *, save: bool):
+    """Limit thread-local pools such as OpenMP.
+
+    Process-wide pools are left untouched. ``ThreadpoolController.limit()``
+    cannot be used here: restoring that limiter writes back every library it
+    snapshotted, including the shared OpenBLAS pool.
+
+    When ``save`` is True, return ``(library, previous_count)`` pairs for
+    :func:`_restore_thread_local_limits`. Workers pass ``save=False`` and keep
+    the limit for the life of the worker thread.
+    """
+    saved = []
+    for lib in controller.lib_controllers:
+        if _is_process_wide_pool(lib):
+            continue
+        original = lib.get_num_threads() if save else None
+        if save:
+            saved.append((lib, original))
+        lib.set_num_threads(num_threads)
+    return saved
+
+
+def _restore_thread_local_limits(saved) -> None:
+    for lib, original in saved:
+        if original is not None:
+            lib.set_num_threads(original)
+
+
+class _SharedPoolLimit:
+    """One process-wide limit for libraries such as OpenBLAS-pthreads.
+
+    Overlapping :class:`~joblib.Parallel` calls must not each snapshot and
+    restore that pool. The first call saves the current counts and applies its
+    limit. Later calls leave the pool alone. The last call to finish restores
+    the saved counts, from whichever thread exits last.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._depth = 0
+        self._applied: list = []
+
+    def enter(self, controller, num_threads: int) -> None:
+        with self._lock:
+            self._depth += 1
+            if self._depth != 1:
+                return
+            applied = []
+            try:
+                for lib in controller.lib_controllers:
+                    if not _is_process_wide_pool(lib):
+                        continue
+                    original = lib.get_num_threads()
+                    result = lib.set_num_threads(num_threads)
+                    if result is _DID_NOT_SET:
+                        continue
+                    applied.append((lib, original))
+                self._applied = applied
+            except BaseException:
+                self._applied = applied
+                self._depth -= 1
+                self._restore_applied()
+                raise
+
+    def exit(self) -> None:
+        with self._lock:
+            if self._depth == 0:
+                return
+            self._depth -= 1
+            if self._depth == 0:
+                self._restore_applied()
+
+    def _restore_applied(self) -> None:
+        applied = self._applied
+        self._applied = []
+        if not applied:
+            # This call never took the claim. Clearing it here would release a
+            # claim held by something outside joblib.
+            return
+        # The thread that took the claim may already have finished. Clearing
+        # lets this thread write the original counts back, and clearing again
+        # lets a later caller take the claim.
+        self._clear_claim()
+        for lib, original in applied:
+            if original is not None:
+                lib.set_num_threads(original)
+        self._clear_claim()
+
+    @staticmethod
+    def _clear_claim() -> None:
+        try:
+            from threadpoolctl import OpenBLASController
+        except ImportError:
+            return
+        clear = getattr(OpenBLASController, "clear_controlling_thread", None)
+        if clear is not None:
+            clear(force=True)
+
+
+_SHARED_POOL_LIMIT = _SharedPoolLimit()
 
 
 class ParallelBackendBase(metaclass=ABCMeta):
@@ -610,14 +735,28 @@ class ThreadingBackend(PoolManagerMixin, ParallelBackendBase):
             # Avoid unnecessary overhead and use sequential backend instead.
             raise FallbackToBackend(SequentialBackend(nesting_level=self.nesting_level))
 
-        CONTROLLING_THREAD_OWNERSHIP.increment()
         self._threadpool_controller = _get_threadpool_controller()
         # Calculate how many cores a worker will get:
         self._worker_cores_per_thread = self._n_threads_for_worker_external_libs(n_jobs)
-        # Limit shared process-level pools (if any) from the current thread:
-        self._thread_limiter = self._threadpool_controller.limit(
-            limits=self._worker_cores_per_thread
+        self._thread_local_limits = []
+        self._shared_pool_limit_active = False
+        # One shared OpenBLAS limit for every Parallel call currently running.
+        # Thread-local pools are limited on this thread too, so a `with
+        # Parallel` block observes the same counts the workers will use.
+        _SHARED_POOL_LIMIT.enter(
+            self._threadpool_controller, self._worker_cores_per_thread
         )
+        self._shared_pool_limit_active = True
+        try:
+            self._thread_local_limits = _set_thread_local_limits(
+                self._threadpool_controller,
+                self._worker_cores_per_thread,
+                save=True,
+            )
+        except BaseException:
+            _SHARED_POOL_LIMIT.exit()
+            self._shared_pool_limit_active = False
+            raise
         self.parallel = parallel
         self._n_jobs = n_jobs
         return n_jobs
@@ -631,21 +770,33 @@ class ThreadingBackend(PoolManagerMixin, ParallelBackendBase):
         if self._pool is None:
 
             def init():
-                # Also set limits from within each Python worker thread so as to
-                # to avoid oversubscription caused by nested use of native threadpools
-                # with thread-local semantics (if any). Please refer to the
-                # threadpoolctl documentation for details about thread-local
-                # vs shared process-level threadpool limiting semantics.
+                # Thread-local pools only (OpenMP and OpenBLAS-OpenMP). The
+                # shared OpenBLAS pool is limited by ``_SHARED_POOL_LIMIT`` on
+                # the calling thread. Setting it here would take that
+                # process-wide claim from a worker and then drop the limiter,
+                # so the lowered count would outlive every Parallel call.
                 set_thread_local_cpu_limit(self._worker_cores_per_thread)
-                self._threadpool_controller.limit(limits=self._worker_cores_per_thread)
+                _set_thread_local_limits(
+                    self._threadpool_controller,
+                    self._worker_cores_per_thread,
+                    save=False,
+                )
 
             self._pool = ThreadPool(self._n_jobs, initializer=init)
         return self._pool
 
     def terminate(self):
-        self._thread_limiter.restore_original_limits()
-        CONTROLLING_THREAD_OWNERSHIP.decrement()
-        super().terminate()
+        try:
+            # Join workers before releasing the shared pool, so this call is
+            # finished with BLAS before the last caller restores the original
+            # thread count.
+            super().terminate()
+        finally:
+            _restore_thread_local_limits(getattr(self, "_thread_local_limits", []))
+            self._thread_local_limits = []
+            if getattr(self, "_shared_pool_limit_active", False):
+                self._shared_pool_limit_active = False
+                _SHARED_POOL_LIMIT.exit()
 
 
 @dataclass

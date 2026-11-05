@@ -2429,6 +2429,93 @@ def test_controlling_thread_openblas_non_openmp(n_jobs):
     # tests so we don't need to do it here.
 
 
+def _process_wide_openblas():
+    """Return one OpenBLAS controller with a process-wide pool, or None."""
+    controller = ThreadpoolController().select(internal_api="openblas")
+    for lib in controller.lib_controllers:
+        if lib.threading_layer != "openmp" and lib.get_num_threads() >= 2:
+            return lib
+    return None
+
+
+@pytest.mark.thread_unsafe  # OpenBLAS's pool is a process-wide shared resource
+@with_numpy
+@with_multiprocessing
+def test_overlapping_threading_calls_do_not_leak_openblas_limit():
+    """Parallel calls from several threads must not stick a lowered BLAS limit.
+
+    Each worker used to call ``threadpoolctl`` and drop the limiter. With a
+    process-wide OpenBLAS pool that set was never restored.
+    """
+    lib = _process_wide_openblas()
+    if lib is None:
+        pytest.skip("requires OpenBLAS with a process-wide thread pool")
+
+    original = lib.get_num_threads()
+
+    def call(n_jobs):
+        for _ in range(20):
+            Parallel(n_jobs=n_jobs, backend="threading")(
+                delayed(int)(i) for i in range(n_jobs)
+            )
+
+    for _ in range(5):
+        threads = [Thread(target=call, args=(n_jobs,)) for n_jobs in (2, 3, 4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        assert lib.get_num_threads() == original
+
+    # The controlling-thread claim must be released too, not only the count.
+    worker = Thread(target=lambda: lib.set_num_threads(1))
+    worker.start()
+    worker.join()
+    try:
+        assert lib.get_num_threads() == 1
+    finally:
+        lib.set_num_threads(original)
+
+
+@pytest.mark.thread_unsafe  # OpenBLAS's pool is a process-wide shared resource
+@with_numpy
+@with_multiprocessing
+def test_openblas_limit_restored_only_after_last_overlapping_call():
+    """A call that finishes must not restore OpenBLAS while another is running."""
+    lib = _process_wide_openblas()
+    if lib is None:
+        pytest.skip("requires OpenBLAS with a process-wide thread pool")
+
+    original = lib.get_num_threads()
+    first_limit = max(cpu_count() // 2, 1)
+    if first_limit == original:
+        pytest.skip("need a per-worker limit that differs from the process default")
+
+    started = threading.Event()
+    release = threading.Event()
+
+    def hold():
+        started.set()
+        assert release.wait(timeout=10)
+        return lib.get_num_threads()
+
+    def run_holder():
+        Parallel(n_jobs=2, backend="threading")(delayed(hold)() for _ in range(2))
+
+    holder = Thread(target=run_holder)
+    holder.start()
+    assert started.wait(timeout=10)
+    # Overlaps the holder and returns while the holder is still inside a task.
+    Parallel(n_jobs=4, backend="threading")(delayed(int)(i) for i in range(4))
+    during = lib.get_num_threads()
+    release.set()
+    holder.join(timeout=10)
+    assert not holder.is_alive()
+
+    assert during == first_limit
+    assert lib.get_num_threads() == original
+
+
 @with_multiprocessing
 @parametrize("n_jobs", [2, 4, -1])
 def test_loky_reuse_workers(n_jobs):
