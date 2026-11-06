@@ -32,7 +32,13 @@ try:
 except ImportError:
     from threadpoolctl import ThreadpoolController as _get_threadpool_controller
 
-from threadpoolctl import shared_pool_limits as _shared_pool_limits
+try:
+    from threadpoolctl import shared_pool_limits as _shared_pool_limits
+except ImportError:
+    # threadpoolctl 3.6 through 3.8 have no shared-pool scope. Callers then use
+    # ThreadpoolController.limit only and do not coordinate a process-wide pool
+    # across threads.
+    _shared_pool_limits = None
 
 from ._multiprocessing_helpers import mp
 from ._utils import (
@@ -615,15 +621,15 @@ class ThreadingBackend(PoolManagerMixin, ParallelBackendBase):
         self._threadpool_controller = _get_threadpool_controller()
         # Calculate how many cores a worker will get:
         self._worker_cores_per_thread = self._n_threads_for_worker_external_libs(n_jobs)
-        # One process-wide scope for every Parallel call currently running.
-        # threadpoolctl keeps the original counts and restores them when the
-        # last scope exits, including from another thread. Open it before the
-        # per-thread limiter so that limiter does not snapshot or restore the
-        # process-wide pool.
-        self._shared_scope = _shared_pool_limits(
-            self._worker_cores_per_thread,
-            controller=self._threadpool_controller,
-        )
+        # Open the shared scope before the per-thread limiter so that limiter
+        # does not snapshot or restore the process-wide pool. Without
+        # shared_pool_limits, the plain limiter is the whole fallback.
+        self._shared_scope = None
+        if _shared_pool_limits is not None:
+            self._shared_scope = _shared_pool_limits(
+                self._worker_cores_per_thread,
+                controller=self._threadpool_controller,
+            )
         try:
             self._thread_limiter = self._threadpool_controller.limit(
                 limits=self._worker_cores_per_thread
@@ -644,10 +650,11 @@ class ThreadingBackend(PoolManagerMixin, ParallelBackendBase):
         if self._pool is None:
 
             def init():
-                # Thread-local pools (OpenMP, OpenBLAS-OpenMP) have to be limited
-                # from each worker. The active shared scope makes threadpoolctl
-                # ignore the process-wide pool here. This limiter is discarded,
-                # so a successful set on that pool would stick for the process.
+                # Thread-local pools have to be limited from each worker. With
+                # shared_pool_limits, threadpoolctl leaves the process-wide pool
+                # to that scope. Without it, this uses the plain global API and
+                # the caller's limiter restores those counts after the pool joins.
+                # This object is discarded, so it must not be the only restore.
                 set_thread_local_cpu_limit(self._worker_cores_per_thread)
                 self._threadpool_controller.limit(limits=self._worker_cores_per_thread)
 

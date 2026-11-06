@@ -72,8 +72,9 @@ In Development
 - Overlapping threading and sequential :class:`~joblib.Parallel` calls share
   one process-wide OpenBLAS limit via threadpoolctl's ``shared_pool_limits``.
   The first call applies it and the last call to finish restores the original
-  counts. This requires the threadpoolctl version that provides
-  ``shared_pool_limits``.
+  counts. threadpoolctl 3.6 through 3.8 have no such scope: joblib still sets
+  limits with ``ThreadpoolController.limit`` and does not coordinate the
+  process-wide pool across threads.
 
 - Dropped support for Python 3.10, which is now end-of-life. NumPy and
   Distributed minimum supported versions were also increased to the oldest
