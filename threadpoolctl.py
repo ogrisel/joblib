@@ -64,6 +64,7 @@ __all__ = [
     "get_cached_controller",
     "register",
     "reset_cached_controller",
+    "shared_pool_limits",
     "threadpool_info",
     "threadpool_limits",
 ]
@@ -462,6 +463,12 @@ class _CDLLCache:
 _CDLL_CACHE = _CDLLCache()
 
 
+# Returned by OpenBLASController.set_num_threads when this thread is not
+# allowed to change the process-wide pool. Callers must not restore a snapshot
+# for a set that did not happen: the snapshot may belong to another thread.
+_DID_NOT_SET = object()
+
+
 class OpenBLASController(LibController):
     """Controller class for OpenBLAS.
 
@@ -576,7 +583,7 @@ class OpenBLASController(LibController):
             return self.set_num_threads(num_threads)
         else:
             # Some other thread controls OpenBLAS: do nothing.
-            return
+            return _DID_NOT_SET
 
     def _real_set_num_threads(self, num_threads):
         # The OpenBLAS limiting API is process-wide, and we want current thread
@@ -637,6 +644,143 @@ class OpenBLASController(LibController):
         return None
 
 
+def _is_process_wide_pool(lib) -> bool:
+    """Whether ``lib`` has one thread pool shared by every Python thread.
+
+    OpenBLAS with pthreads or the Windows threading layer qualifies. Its
+    OpenMP build is thread-local and is not included.
+    """
+    return (
+        isinstance(lib, OpenBLASController)
+        and getattr(lib, "threading_layer", None) != "openmp"
+    )
+
+
+class _SharedPoolScopeState:
+    """Baseline and depth for :class:`shared_pool_limits`.
+
+    The baseline is the thread counts from before the first active scope.
+    Later scopes must not replace it with a snapshot of the already limited
+    pool.
+    """
+
+    def __init__(self) -> None:
+        self.lock = Lock()
+        self.depth = 0
+        self.applied = []
+
+    def restore(self) -> None:
+        applied = self.applied
+        self.applied = []
+        if not applied:
+            return
+        # The thread that took the claim may already have finished. Clearing
+        # lets this thread write the original counts, and clearing again lets
+        # a later caller take the claim.
+        OpenBLASController.clear_controlling_thread(force=True)
+        for lib, original in applied:
+            if original is not None:
+                lib.set_num_threads(original)
+        OpenBLASController.clear_controlling_thread(force=True)
+
+
+_SHARED_POOL_SCOPE = _SharedPoolScopeState()
+
+
+def _shared_pool_scope_is_active() -> bool:
+    return _SHARED_POOL_SCOPE.depth > 0
+
+
+class shared_pool_limits:
+    """Limit process-wide pools for one shared, reference-counted scope.
+
+    Use this when several Python threads each limit a process-wide pool
+    (OpenBLAS with pthreads or the Windows threading layer) and the original
+    counts must be restored once, by whichever thread exits last.
+
+    The first overlapping scope saves the current counts and applies
+    ``limits``. Later scopes do not change those counts: one process-wide pool
+    cannot honor two limits at once, and changing it while another thread is
+    inside a BLAS call is unsafe. The last :meth:`release` restores the saved
+    counts and drops the OpenBLAS controlling-thread claim.
+
+    Thread-local pools are unchanged. Keep using :class:`threadpool_limits`
+    for those. While one of these scopes is active, :class:`threadpool_limits`
+    does not change or restore the process-wide pools, so the two compose.
+
+    Parameters
+    ----------
+    limits : int
+        Thread count applied to every process-wide pool known to ``controller``.
+    controller : ThreadpoolController or None
+        Libraries to cover. ``None`` uses :func:`get_cached_controller`.
+
+    Notes
+    -----
+    Construction already enters the scope, so both ``shared_pool_limits(2)``
+    and ``with shared_pool_limits(2)`` work. :meth:`release` is idempotent.
+    Open this scope before any :class:`threadpool_limits` that should observe
+    the shared baseline.
+    """
+
+    def __init__(self, limits, controller=None):
+        if isinstance(limits, bool) or not isinstance(limits, int):
+            raise TypeError(f"limits must be an int, got {limits!r}")
+        if limits < 1:
+            raise ValueError(f"limits must be >= 1, got {limits}")
+        self._limits = limits
+        self._controller = controller
+        self._released = False
+        self._enter()
+
+    def _controller_or_cached(self):
+        if self._controller is not None:
+            return self._controller
+        return get_cached_controller()
+
+    def _enter(self):
+        controller = self._controller_or_cached()
+        with _SHARED_POOL_SCOPE.lock:
+            _SHARED_POOL_SCOPE.depth += 1
+            if _SHARED_POOL_SCOPE.depth != 1:
+                return
+            applied = []
+            try:
+                for lib in controller.lib_controllers:
+                    if not _is_process_wide_pool(lib):
+                        continue
+                    original = lib.get_num_threads()
+                    result = lib.set_num_threads(self._limits)
+                    if result is _DID_NOT_SET:
+                        continue
+                    applied.append((lib, original))
+                _SHARED_POOL_SCOPE.applied = applied
+            except BaseException:
+                _SHARED_POOL_SCOPE.applied = applied
+                _SHARED_POOL_SCOPE.depth -= 1
+                _SHARED_POOL_SCOPE.restore()
+                self._released = True
+                raise
+
+    def release(self):
+        """Leave this scope. The last active scope restores the baseline."""
+        with _SHARED_POOL_SCOPE.lock:
+            if self._released:
+                return
+            self._released = True
+            if _SHARED_POOL_SCOPE.depth == 0:
+                return
+            _SHARED_POOL_SCOPE.depth -= 1
+            if _SHARED_POOL_SCOPE.depth == 0:
+                _SHARED_POOL_SCOPE.restore()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.release()
+
+
 class _ControllingThreadOwnership(thread_local):
     """Count how many paired limit-unlimits have modified OpenBLAS.
 
@@ -655,7 +799,9 @@ class _ControllingThreadOwnership(thread_local):
     def decrement(self):
         """Decrement ownership."""
         self.count -= 1
-        if self.count <= 0:
+        if self.count <= 0 and not _shared_pool_scope_is_active():
+            # A shared_pool_limits scope owns the claim until its own last
+            # release. Dropping a thread-local limiter must not clear it.
             OpenBLASController.clear_controlling_thread()
 
 
@@ -1106,6 +1252,9 @@ class _ThreadpoolLimiter:
             controller, limits, user_api
         )
         self._original_info = self._controller.info()
+        # Indexes of libraries this limiter actually changed. Restoring a
+        # library whose set was refused writes another thread's snapshot.
+        self._changed_libs = []
         self._set_threadpool_limits()
 
     def __enter__(self):
@@ -1124,11 +1273,20 @@ class _ThreadpoolLimiter:
         )
 
     def restore_original_limits(self):
-        """Set the limits back to their original values"""
-        for lib_controller, original_info in zip(
-            self._controller.lib_controllers, self._original_info
-        ):
-            lib_controller.set_num_threads(original_info["num_threads"])
+        """Set the limits back to their original values.
+
+        Only libraries this limiter actually changed are restored. A refused
+        ``set_num_threads`` on a process-wide pool is not undone, and neither
+        is a pool currently owned by :class:`shared_pool_limits`.
+        """
+        changed = self._changed_libs
+        self._changed_libs = []
+        for index in changed:
+            lib_controller = self._controller.lib_controllers[index]
+            if _is_process_wide_pool(lib_controller) and _shared_pool_scope_is_active():
+                continue
+            original = self._original_info[index]["num_threads"]
+            lib_controller.set_num_threads(original)
 
     # Alias of `restore_original_limits` for backward compatibility
     unregister = restore_original_limits
@@ -1174,7 +1332,8 @@ class _ThreadpoolLimiter:
         if self._limits is None:
             return
 
-        for lib_controller in self._controller.lib_controllers:
+        controllers = self._controller.lib_controllers
+        for index, lib_controller in enumerate(controllers):
             # self._limits is a dict {key: num_threads} where key is either a
             # filepath, a prefix, or a user_api. Libraries are matched in that
             # order.
@@ -1187,8 +1346,17 @@ class _ThreadpoolLimiter:
             else:
                 continue
 
-            if num_threads is not None:
-                lib_controller.set_num_threads(num_threads)
+            if num_threads is None:
+                continue
+            # shared_pool_limits owns process-wide pools for its whole scope,
+            # including their original values. A per-thread limiter must not
+            # take or restore them in the middle of that scope.
+            if _is_process_wide_pool(lib_controller) and _shared_pool_scope_is_active():
+                continue
+            result = lib_controller.set_num_threads(num_threads)
+            if result is _DID_NOT_SET:
+                continue
+            self._changed_libs.append(index)
 
 
 class _ThreadpoolLimiterDecorator(ContextDecorator):
@@ -1455,6 +1623,14 @@ class ThreadpoolController:
             - If None, this function will apply to all supported libraries.
         """
         return _ThreadpoolLimiter(self, limits=limits, user_api=user_api)
+
+    def limit_shared_pools(self, limits):
+        """Limit this controller's process-wide pools for a shared scope.
+
+        See :class:`shared_pool_limits`. ``limits`` is the thread count used if
+        this scope is the first one currently active.
+        """
+        return shared_pool_limits(limits, controller=self)
 
     @_format_docstring(
         USER_APIS=", ".join(f'"{api}"' for api in _ALL_USER_APIS),

@@ -8,7 +8,7 @@ import shutil
 import subprocess
 import sys
 import time
-from threading import Lock, Thread, current_thread
+from threading import Event, Lock, Thread, current_thread
 
 import pytest
 
@@ -912,6 +912,99 @@ def _require_resizable_non_openmp_openblas():
     if orig is None or orig < 2:
         pytest.skip("Test requires a non-OpenMP OpenBLAS with at least 2 threads")
     return libs, lib, orig
+
+
+def test_overlapping_threadpool_limits_do_not_restore_a_foreign_snapshot(request):
+    """A thread that failed to set the shared pool must not restore it."""
+    libs, lib, orig_limit = _require_resizable_non_openmp_openblas()
+    request.addfinalizer(_restore_openblas_thread_counts(libs))
+    a_in, b_in, a_out = (Event() for _ in range(3))
+
+    def thread_a():
+        with threadpool_limits(2):
+            a_in.set()
+            b_in.wait()
+        a_out.set()
+
+    def thread_b():
+        a_in.wait()
+        with threadpool_limits(1):
+            b_in.set()
+            a_out.wait()
+
+    threads = [Thread(target=thread_a), Thread(target=thread_b)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert lib.get_num_threads() == orig_limit
+    assert _openblas_controlling_thread() is None
+
+
+def test_shared_pool_limits_restores_baseline_from_the_last_thread(request):
+    """Overlapping shared scopes restore the count from before the first one."""
+    libs, lib, orig_limit = _require_resizable_non_openmp_openblas()
+    request.addfinalizer(_restore_openblas_thread_counts(libs))
+    controller = ThreadpoolController()
+    started = Event()
+    release = Event()
+    seen = {}
+
+    def hold():
+        with controller.limit_shared_pools(1):
+            seen["during"] = lib.get_num_threads()
+            started.set()
+            assert release.wait(timeout=10)
+
+    holder = Thread(target=hold)
+    holder.start()
+    assert started.wait(timeout=10)
+    # Asks for the original count, which must not replace the first scope.
+    with controller.limit_shared_pools(orig_limit):
+        seen["overlap"] = lib.get_num_threads()
+    # The second scope has exited. The first must still own the pool.
+    seen["after_overlap"] = lib.get_num_threads()
+    release.set()
+    holder.join(timeout=10)
+
+    assert seen["during"] == 1
+    assert seen["overlap"] == 1
+    assert seen["after_overlap"] == 1
+    assert lib.get_num_threads() == orig_limit
+    assert _openblas_controlling_thread() is None
+
+
+def test_threadpool_limits_does_not_clobber_an_active_shared_scope(request):
+    libs, lib, orig_limit = _require_resizable_non_openmp_openblas()
+    request.addfinalizer(_restore_openblas_thread_counts(libs))
+    controller = ThreadpoolController()
+
+    with controller.limit_shared_pools(2):
+        with threadpool_limits(limits=1):
+            assert lib.get_num_threads() == 2
+        assert lib.get_num_threads() == 2
+        assert _openblas_controlling_thread() is current_thread()
+
+    assert lib.get_num_threads() == orig_limit
+    assert _openblas_controlling_thread() is None
+
+
+def test_shared_pool_scope_can_be_released_by_another_thread(request):
+    libs, lib, orig_limit = _require_resizable_non_openmp_openblas()
+    request.addfinalizer(_restore_openblas_thread_counts(libs))
+    scope = ThreadpoolController().limit_shared_pools(1)
+    assert lib.get_num_threads() == 1
+
+    worker = Thread(target=scope.release)
+    worker.start()
+    worker.join()
+
+    assert lib.get_num_threads() == orig_limit
+    assert _openblas_controlling_thread() is None
+    # Releasing twice is safe.
+    scope.release()
+    assert lib.get_num_threads() == orig_limit
 
 
 @pytest.mark.parametrize(

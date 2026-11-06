@@ -1,6 +1,15 @@
 3.9.0 (under development)
 =========================
 
+- Add :class:`shared_pool_limits` and
+  ``ThreadpoolController.limit_shared_pools``. Overlapping scopes share one
+  baseline for process-wide pools such as OpenBLAS-pthreads: the first scope
+  applies its limit, later scopes leave that limit in place, and the last
+  ``release`` restores the original counts from whichever thread exits last.
+  :class:`threadpool_limits` no longer restores a process-wide pool it failed
+  to change, and it leaves those pools alone while a ``shared_pool_limits``
+  scope is active, so the two can be used together.
+
 3.8.0 (2026-11-05)
 ==================
 
