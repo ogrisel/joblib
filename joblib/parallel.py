@@ -1917,8 +1917,7 @@ class Parallel(Logger):
             # scope is active, leaves the process-wide OpenBLAS pool to it.
             controller = _get_threadpool_controller()
             num_threads = self._backend._n_threads_for_worker_external_libs(n_jobs=1)
-            if _shared_pool_limits is not None:
-                shared_scope = _shared_pool_limits(num_threads, controller=controller)
+            shared_scope = _shared_pool_limits(num_threads, controller=controller)
             limiter = controller.limit(limits=num_threads)
             self._iterating = True
             self._original_iterator = iterable
