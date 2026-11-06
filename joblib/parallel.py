@@ -36,6 +36,7 @@ from ._parallel_backends import (
     SequentialBackend,
     ThreadingBackend,
     _get_threadpool_controller,
+    _shared_pool_limits,
     cpu_count,  # noqa
     set_thread_local_cpu_limit,  # noqa
 )
@@ -1909,11 +1910,16 @@ class Parallel(Logger):
         overhead of calling sequential tasks with `joblib`.
         """
         limiter = None
+        shared_scope = None
         try:
-            # This makes relevant libraries respect cgroups, for example:
-            limiter = _get_threadpool_controller().limit(
-                limits=self._backend._n_threads_for_worker_external_libs(n_jobs=1)
-            )
+            # The shared scope goes first so it records the real baseline.
+            # threadpool_limits then limits thread-local pools and, while the
+            # scope is active, leaves the process-wide OpenBLAS pool to it.
+            controller = _get_threadpool_controller()
+            num_threads = self._backend._n_threads_for_worker_external_libs(n_jobs=1)
+            if _shared_pool_limits is not None:
+                shared_scope = _shared_pool_limits(num_threads, controller=controller)
+            limiter = controller.limit(limits=num_threads)
             self._iterating = True
             self._original_iterator = iterable
             batch_size = self._get_batch_size()
@@ -1947,6 +1953,8 @@ class Parallel(Logger):
             # limiter might be None if instantiating it failed.
             if limiter is not None:
                 limiter.restore_original_limits()
+            if shared_scope is not None:
+                shared_scope.release()
             self._running = False
             self._iterating = False
             self._original_iterator = None

@@ -69,6 +69,12 @@ In Development
   splitting used by workers to limit OpenMP and BLAS libraries.
   https://github.com/joblib/joblib/pull/1871
 
+- With threadpoolctl's ``shared_pool_limits`` (3.9 and later), overlapping
+  threading and sequential :class:`~joblib.Parallel` calls share one
+  process-wide OpenBLAS limit. The first call applies it and the last call to
+  finish restores the original counts. Older threadpoolctl keeps the previous
+  per-call behavior.
+
 - Dropped support for Python 3.10, which is now end-of-life. NumPy and
   Distributed minimum supported versions were also increased to the oldest
   versions that support 3.11.
